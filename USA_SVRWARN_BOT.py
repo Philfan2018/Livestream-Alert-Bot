@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 USA_SVRWARN_BOT.py - Enhanced weather alert bot for US and Canada.
 Monitors IEM RSS and Environment Canada API for severe weather alerts.
@@ -13,29 +12,17 @@ import sys
 import re
 import json
 from datetime import datetime, timedelta
+from collections import deque
 
 import pygame
 import feedparser
 import requests
 
-# Create a stream handler that ignores encoding errors
-console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setLevel(logging.INFO)
-console_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-
-# File handler (UTF-8 safe)
-file_handler = logging.FileHandler("weather_bot.log", encoding="utf-8")
-file_handler.setLevel(logging.INFO)
-file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-
-# Configure root logger
-logging.basicConfig(
-    level=logging.INFO,
-    handlers=[console_handler, file_handler],
-    force=True  # overwrite any existing config
-)
-
-logger = logging.getLogger(__name__)
+# -------------------- ENCODING FIX FOR WINDOWS CONSOLE --------------------
+# Force stdout/stderr to UTF-8 to avoid Unicode errors with emojis
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout = open(sys.stdout.fileno(), mode='w', encoding='utf-8', buffering=1)
+    sys.stderr = open(sys.stderr.fileno(), mode='w', encoding='utf-8', buffering=1)
 
 # -------------------- CONFIGURATION --------------------
 IEM_RSS_URL = "https://weather.im/iembot-rss/room/botstalk.xml"
@@ -65,33 +52,68 @@ SOUND_FILES = {
     "EC_ALERT": "ffw_standard.mp3"
 }
 
-# -------------------- LOGGING SETUP --------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler("weather_bot.log"),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
+# -------------------- LOGGING SETUP (clean console, full file) --------------------
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
-# -------------------- AUDIO PLAYER (Non‑blocking) --------------------
-def play_alert_sound_async(threat_level):
-    """Play a sound in a separate thread to avoid blocking the main loop."""
-    filename = SOUND_FILES.get(threat_level, SOUND_FILES.get("GENERIC_WARNING"))
-    if not os.path.exists(filename):
-        logger.warning(f"Audio file '{filename}' not found – skipping sound.")
-        return
+# File handler: full timestamp and level
+file_handler = logging.FileHandler("weather_bot.log", encoding="utf-8")
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
 
-    def _play():
+# Console handler: message only (no timestamp/level)
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(logging.Formatter("%(message)s"))
+
+# Add both handlers
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
+logger.propagate = False  # Prevent duplicate logs from root logger
+
+# -------------------- SOUND QUEUE (Non‑blocking, sequential) --------------------
+class SoundQueue:
+    def __init__(self):
+        self.queue = deque()
+        self.lock = threading.Lock()
+        self.playing = False
+        self.thread = None
+
+    def _play_next(self):
+        with self.lock:
+            if not self.queue:
+                self.playing = False
+                return
+            filename = self.queue.popleft()
         try:
+            # Load and play sound – this blocks until it finishes
             sound = pygame.mixer.Sound(filename)
             sound.play()
+            while pygame.mixer.get_busy():
+                time.sleep(0.1)
         except Exception as e:
             logger.error(f"Error playing sound {filename}: {e}")
+        # Continue with next in queue
+        self._play_next()
 
-    threading.Thread(target=_play, daemon=True).start()
+    def add_sound(self, filename):
+        if not os.path.exists(filename):
+            logger.warning(f"Audio file '{filename}' not found – skipping.")
+            return
+        with self.lock:
+            self.queue.append(filename)
+            if not self.playing:
+                self.playing = True
+                # Start playing in a separate thread
+                threading.Thread(target=self._play_next, daemon=True).start()
+
+# Global sound queue instance
+sound_queue = SoundQueue()
+
+def play_alert_sound_async(threat_level):
+    """Queue a sound for playback (sequential, non‑blocking)."""
+    filename = SOUND_FILES.get(threat_level, SOUND_FILES.get("GENERIC_WARNING"))
+    sound_queue.add_sound(filename)
 
 # -------------------- UTILITY FUNCTIONS --------------------
 def is_target_event(title, text, is_canada=False):
@@ -205,29 +227,32 @@ def determine_threat_level(title, text):
     if "MESOSCALE PRECIPITATION" in title_upper or ("WPC" in title_upper and "MESOSCALE" in title_upper):
         return "WPC_DISCUSSION"
 
-    # Local warnings (NWS offices)
+    # Local warnings (NWS offices) - use flexible regex for damage threat
+    # Tornado Warning
     if "TORNADO WARNING" in title_upper or ("STATEMENT" in title_upper and "TORNADO" in text_upper):
-        if "DAMAGE THREAT...CATASTROPHIC" in text_upper:
+        if re.search(r'DAMAGE THREAT.*CATASTROPHIC', text_upper):
             return "TORNADO_EMERGENCY"
-        elif "DAMAGE THREAT...CONSIDERABLE" in text_upper:
+        elif re.search(r'DAMAGE THREAT.*CONSIDERABLE', text_upper):
             return "TORNADO_PDS"
         elif "TORNADO...OBSERVED" in text_upper:
             return "TORNADO_OBSERVED"
         else:
             return "TORNADO_STANDARD"
 
+    # Severe Thunderstorm Warning
     if "SEVERE THUNDERSTORM WARNING" in title_upper or ("STATEMENT" in title_upper and "SEVERE THUNDERSTORM" in text_upper):
-        if "DAMAGE THREAT...DESTRUCTIVE" in text_upper:
+        if re.search(r'DAMAGE THREAT.*DESTRUCTIVE', text_upper):
             return "SVR_DESTRUCTIVE"
-        elif "DAMAGE THREAT...CONSIDERABLE" in text_upper:
+        elif re.search(r'DAMAGE THREAT.*CONSIDERABLE', text_upper):
             return "SVR_CONSIDERABLE"
         else:
             return "SVR_STANDARD"
 
+    # Flash Flood Warning
     if "FLASH FLOOD WARNING" in title_upper:
-        if "DAMAGE THREAT...CATASTROPHIC" in text_upper:
+        if re.search(r'DAMAGE THREAT.*CATASTROPHIC', text_upper):
             return "FFW_EMERGENCY"
-        elif "DAMAGE THREAT...CONSIDERABLE" in text_upper:
+        elif re.search(r'DAMAGE THREAT.*CONSIDERABLE', text_upper):
             return "FFW_CONSIDERABLE"
         else:
             return "FFW_STANDARD"
